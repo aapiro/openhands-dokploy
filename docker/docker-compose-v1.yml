@@ -1,0 +1,286 @@
+version: '3.8'
+
+services:
+  # Base de datos PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    container_name: openhands-postgres
+    environment:
+      POSTGRES_DB: openhands
+      POSTGRES_USER: openhands
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme123}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openhands -d openhands"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - openhands-internal
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 512M
+    # Labels específicos para Dokploy
+    labels:
+      - "traefik.enable=false"
+      - "dokploy.service=database"
+
+  # Redis para cache y sesiones
+  redis:
+    image: redis:7-alpine
+    container_name: openhands-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis123}
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "auth", "${REDIS_PASSWORD:-redis123}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - openhands-internal
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+    labels:
+      - "traefik.enable=false"
+      - "dokploy.service=cache"
+
+  # OpenHands aplicación principal
+  openhands:
+    image: ghcr.io/all-hands-ai/openhands:${OPENHANDS_VERSION:-latest}
+    container_name: openhands-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Base de datos y cache
+      DATABASE_URL: postgresql://openhands:${POSTGRES_PASSWORD:-changeme123}@postgres:5432/openhands
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis123}@redis:6379/0
+
+      # Configuración de aplicación
+      OPENHANDS_ENV: production
+      SECRET_KEY: ${SECRET_KEY:-your-super-secret-key-change-in-production}
+      JWT_SECRET: ${JWT_SECRET:-your-jwt-secret-change-in-production}
+
+      # Configuración de dominio (Dokploy maneja esto)
+      ALLOWED_HOSTS: ${DOKPLOY_DOMAIN},localhost,127.0.0.1
+      CORS_ALLOWED_ORIGINS: https://${DOKPLOY_DOMAIN},http://localhost:3000
+
+      # Configuración de recursos
+      MAX_WORKERS: ${MAX_WORKERS:-4}
+      WORKER_TIMEOUT: ${WORKER_TIMEOUT:-300}
+      MAX_REQUEST_SIZE: ${MAX_REQUEST_SIZE:-50MB}
+
+      # Logging optimizado para contenedores
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: json
+      LOG_TO_STDOUT: "true"
+
+      # Sandbox configuration
+      SANDBOX_TYPE: docker
+      SANDBOX_TIMEOUT: ${SANDBOX_TIMEOUT:-300}
+      MAX_CONCURRENT_SESSIONS: ${MAX_CONCURRENT_SESSIONS:-10}
+
+      # AI Model configuration
+      LLM_MODEL: ${LLM_MODEL:-gpt-4}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+
+      # File storage
+      WORKSPACE_BASE: /app/workspace
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE:-100MB}
+
+      # Security headers (Dokploy/Traefik también maneja esto)
+      SECURE_SSL_REDIRECT: ${SECURE_SSL_REDIRECT:-true}
+      SECURE_PROXY_SSL_HEADER: "HTTP_X_FORWARDED_PROTO,https"
+
+      # Session configuration
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
+      SESSION_COOKIE_HTTPONLY: "true"
+      SESSION_COOKIE_SAMESITE: "Lax"
+
+      # CORS configuration para Dokploy
+      CORS_ALLOW_CREDENTIALS: "true"
+      CORS_ALLOWED_HEADERS: "accept,accept-encoding,authorization,content-type,dnt,origin,user-agent,x-csrftoken,x-requested-with"
+
+      # Feature flags
+      ENABLE_SIGNUP: ${ENABLE_SIGNUP:-false}
+      ENABLE_METRICS: ${ENABLE_METRICS:-true}
+      ENABLE_WEBSOCKETS: ${ENABLE_WEBSOCKETS:-true}
+
+    volumes:
+      # Workspace persistente
+      - workspace_data:/app/workspace
+      - temp_data:/tmp
+      # Docker socket para sandbox (con permisos limitados)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Logs para Dokploy
+      - logs_data:/app/logs
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    networks:
+      - openhands-internal
+      - dokploy-network
+
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-4G}
+          cpus: ${CPU_LIMIT:-2.0}
+        reservations:
+          memory: ${MEMORY_RESERVATION:-2G}
+          cpus: ${CPU_RESERVATION:-1.0}
+
+    # Configuración de seguridad
+    security_opt:
+      - no-new-privileges:true
+
+    # Límites del sistema
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    # Labels para Dokploy/Traefik
+    labels:
+      # Traefik configuration
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+
+      # HTTP Router
+      - "traefik.http.routers.openhands.rule=Host(`${DOKPLOY_DOMAIN:-openhands.yourdomain.com}`)"
+      - "traefik.http.routers.openhands.entrypoints=websecure"
+      - "traefik.http.routers.openhands.tls.certresolver=letsencrypt"
+
+      # Service
+      - "traefik.http.services.openhands.loadbalancer.server.port=3000"
+      - "traefik.http.services.openhands.loadbalancer.healthcheck.path=/api/health"
+      - "traefik.http.services.openhands.loadbalancer.healthcheck.interval=10s"
+
+      # Middleware para WebSocket support
+      - "traefik.http.middlewares.openhands-headers.headers.customrequestheaders.X-Forwarded-Proto=https"
+      - "traefik.http.middlewares.openhands-ws.headers.customrequestheaders.Connection=upgrade"
+      - "traefik.http.middlewares.openhands-ws.headers.customrequestheaders.Upgrade=websocket"
+      - "traefik.http.routers.openhands.middlewares=openhands-headers,openhands-ws"
+
+      # Security headers
+      - "traefik.http.middlewares.openhands-security.headers.frameDeny=true"
+      - "traefik.http.middlewares.openhands-security.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.openhands-security.headers.browserXssFilter=true"
+      - "traefik.http.middlewares.openhands-security.headers.referrerPolicy=strict-origin-when-cross-origin"
+      - "traefik.http.routers.openhands.middlewares=openhands-security"
+
+      # Rate limiting
+      - "traefik.http.middlewares.openhands-ratelimit.ratelimit.average=100"
+      - "traefik.http.middlewares.openhands-ratelimit.ratelimit.burst=50"
+      - "traefik.http.routers.openhands.middlewares=openhands-ratelimit"
+
+      # Dokploy specific labels
+      - "dokploy.project=openhands"
+      - "dokploy.service=app"
+      - "dokploy.enable=true"
+      - "dokploy.domain=${DOKPLOY_DOMAIN:-openhands.yourdomain.com}"
+
+  # Servicio de métricas (opcional, separado para mejor observabilidad)
+  metrics:
+    image: prom/prometheus:latest
+    container_name: openhands-metrics
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=7d'  # 7 días para no usar mucho espacio
+      - '--web.enable-lifecycle'
+      - '--web.route-prefix=/'
+    volumes:
+      - metrics_data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - openhands-internal
+      - dokploy-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.25'
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.routers.openhands-metrics.rule=Host(`${DOKPLOY_DOMAIN:-openhands.yourdomain.com}`) && PathPrefix(`/metrics`)"
+      - "traefik.http.routers.openhands-metrics.entrypoints=websecure"
+      - "traefik.http.routers.openhands-metrics.tls.certresolver=letsencrypt"
+      - "traefik.http.services.openhands-metrics.loadbalancer.server.port=9090"
+      # Proteger métricas con basic auth
+      - "traefik.http.routers.openhands-metrics.middlewares=auth"
+      - "traefik.http.middlewares.auth.basicauth.users=${METRICS_AUTH:-admin:$$2y$$10$$8Z8Z8Z8Z8Z8Z8Z8Z8Z8Z8O}"
+      - "dokploy.service=metrics"
+
+volumes:
+  postgres_data:
+    driver: local
+    labels:
+      - "dokploy.backup=true"
+      - "dokploy.backup.schedule=0 2 * * *"  # Backup diario a las 2 AM
+
+  redis_data:
+    driver: local
+    labels:
+      - "dokploy.backup=true"
+      - "dokploy.backup.schedule=0 3 * * *"
+
+  workspace_data:
+    driver: local
+    labels:
+      - "dokploy.backup=true"
+      - "dokploy.backup.schedule=0 1 * * *"
+
+  logs_data:
+    driver: local
+
+  temp_data:
+    driver: local
+
+  metrics_data:
+    driver: local
+
+networks:
+  # Red interna para comunicación entre servicios
+  openhands-internal:
+    driver: bridge
+    internal: true
+    labels:
+      - "dokploy.network=internal"
+
+  # Red de Dokploy para acceso externo vía Traefik
+  dokploy-network:
+    external: true
+    labels:
+      - "dokploy.network=external"

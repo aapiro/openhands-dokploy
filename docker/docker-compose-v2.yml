@@ -1,0 +1,137 @@
+services:
+  # Base de datos PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    container_name: openhands-postgres
+    environment:
+      POSTGRES_DB: openhands
+      POSTGRES_USER: openhands
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme123}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openhands -d openhands"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "traefik.enable=false"
+
+  # Redis para cache y sesiones
+  redis:
+    image: redis:7-alpine
+    container_name: openhands-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis123}
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "auth", "${REDIS_PASSWORD:-redis123}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    labels:
+      - "traefik.enable=false"
+
+  # OpenHands aplicación principal
+  openhands:
+    image: ghcr.io/all-hands-ai/openhands:${OPENHANDS_VERSION:-latest}
+    container_name: openhands-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # Base de datos y cache
+      DATABASE_URL: postgresql://openhands:${POSTGRES_PASSWORD:-changeme123}@postgres:5432/openhands
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis123}@redis:6379/0
+
+      # Configuración de aplicación
+      OPENHANDS_ENV: production
+      SECRET_KEY: ${SECRET_KEY:-your-super-secret-key-change-in-production}
+      JWT_SECRET: ${JWT_SECRET:-your-jwt-secret-change-in-production}
+
+      # Configuración de dominio
+      ALLOWED_HOSTS: ${DOKPLOY_DOMAIN:-localhost},localhost,127.0.0.1
+      CORS_ALLOWED_ORIGINS: https://${DOKPLOY_DOMAIN:-localhost},http://localhost:3000
+
+      # Configuración de recursos
+      MAX_WORKERS: ${MAX_WORKERS:-4}
+      WORKER_TIMEOUT: ${WORKER_TIMEOUT:-300}
+
+      # Configuración de logging mejorada
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: json
+      LOG_TO_STDOUT: "true"
+      PYTHONUNBUFFERED: "1"
+
+      # Configuración de memoria y performance
+      MEMORY_LIMIT: ${MEMORY_LIMIT:-4G}
+      MAX_CONCURRENT_CONVERSATIONS: ${MAX_CONCURRENT_CONVERSATIONS:-5}
+
+      # Configuración de agente
+      AGENT_CLASS: CodeActAgent
+      MAX_ITERATIONS: ${MAX_ITERATIONS:-100}
+
+      # Sandbox configuration
+      SANDBOX_TYPE: docker
+      SANDBOX_TIMEOUT: ${SANDBOX_TIMEOUT:-300}
+      ENABLE_AUTO_LINT: ${ENABLE_AUTO_LINT:-true}
+
+      # AI Model configuration
+      LLM_MODEL: ${LLM_MODEL:-gpt-4}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
+
+      # File storage
+      WORKSPACE_BASE: /app/workspace
+      MAX_FILE_SIZE: ${MAX_FILE_SIZE:-100MB}
+
+      # Security
+      SECURE_SSL_REDIRECT: ${SECURE_SSL_REDIRECT:-true}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
+
+    volumes:
+      - workspace_data:/app/workspace
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    networks:
+      - default
+      - dokploy-network
+
+    # Labels para Dokploy/Traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=dokploy-network"
+      - "traefik.http.routers.openhands.rule=Host(`${DOKPLOY_DOMAIN:-localhost}`)"
+      - "traefik.http.routers.openhands.entrypoints=websecure"
+      - "traefik.http.routers.openhands.tls.certresolver=letsencrypt"
+      - "traefik.http.services.openhands.loadbalancer.server.port=3000"
+      - "dokploy.project=openhands"
+      - "dokploy.service=app"
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  workspace_data:
+    driver: local
+
+networks:
+  dokploy-network:
+    external: true
